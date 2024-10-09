@@ -12,7 +12,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <getopt.h>
-
+#include <arpa/inet.h>
+#include <errno.h>  // Add this for errno and error codes
+#include <sys/socket.h>  // Add this for socket-related errors like EPIPE and ECONNRESET
+#include "hidapi_darwin.h"
 #include "hidapi.h"
 
 
@@ -23,6 +26,144 @@
 #ifndef HIDAPITESTER_VERSION
 #define HIDAPITESTER_VERSION "v0.0"
 #endif
+
+#define DEFAULT_SERVER_IP "127.0.0.1"
+#define DEFAULT_SERVER_PORT 5000
+#define RECONNECT_DELAY 5  // seconds to wait before reconnecting
+#define MAX_RETRY 5        // number of retry attempts
+
+int sockfd = -1;
+char *server_ip = DEFAULT_SERVER_IP;
+int server_port = DEFAULT_SERVER_PORT;
+
+// Enable KEEPALIVE to detect broken connections
+void set_keepalive(int sockfd) {
+    int optval = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval)) < 0) {
+        perror("Erreur lors de l'activation de SO_KEEPALIVE");
+    }
+}
+
+// Set timeout for send and recv
+void set_socket_timeout(int sockfd, int timeout_seconds) {
+    struct timeval timeout;
+    timeout.tv_sec = timeout_seconds;
+    timeout.tv_usec = 0;
+
+    // Set the timeout for send and receive operations
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Erreur lors de la définition du délai d'attente pour la réception");
+    }
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Erreur lors de la définition du délai d'attente pour l'envoi");
+    }
+}
+
+int connect_to_server(const char *server_ip, int server_port) {
+    struct sockaddr_in server_addr;
+    int retry_count = 0;
+
+    while (retry_count < MAX_RETRY) {
+        // Create socket
+        if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            perror("Erreur de création du socket");
+            retry_count++;
+            sleep(RECONNECT_DELAY);  // wait before retrying
+            continue;
+        }
+
+        // Set socket options
+        set_keepalive(sockfd);        // Enable keepalive
+        set_socket_timeout(sockfd, 5); // Set timeout for send and receive
+        
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(server_port);
+
+        // Convert IP address
+        if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+            perror("Adresse IP invalide ou non supportée");
+            close(sockfd);
+            retry_count++;
+            sleep(RECONNECT_DELAY);  // wait before retrying
+            continue;
+        }
+
+        // Connect to server
+        if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+            perror("Erreur de connexion au serveur");
+            close(sockfd);
+            retry_count++;
+            sleep(RECONNECT_DELAY);  // wait before retrying
+        } else {
+            printf("Connexion au serveur réussie sur %s:%d\n", server_ip, server_port);
+            return sockfd;
+        }
+    }
+
+    // If we fail to connect after retries, return -1
+    return -1;
+}
+
+
+void send_data_to_server(int *sockfd, const unsigned char *data, size_t length) {
+    if (*sockfd < 0) {
+        fprintf(stderr, "Descripteur de fichier invalide (sockfd=%d)\n", *sockfd);
+        return;
+    }
+
+    unsigned char *data_with_newline = malloc(length + 2);  // +2 for '\r\n'
+    if (!data_with_newline) {
+        fprintf(stderr, "Erreur d'allocation mémoire\n");
+        return;
+    }
+
+    memcpy(data_with_newline, data, length);
+    data_with_newline[length] = '\r';
+    data_with_newline[length+1] = '\n';  // Add newline at the end
+
+    size_t total_sent = 0;
+    ssize_t bytes_sent;
+
+    while (total_sent < length + 2) {
+        bytes_sent = send(*sockfd, data_with_newline + total_sent, length + 2 - total_sent, 0);
+        if (bytes_sent < 0) {
+            perror("Erreur d'envoi de données");
+            fflush(stderr);
+
+            // Handle disconnection here
+            if (errno == EPIPE || errno == ECONNRESET || errno == EBADF) {
+                printf("La connexion a été interrompue. Tentative de reconnexion...\n");
+                fflush(stdout);
+                close(*sockfd);  // Close the socket
+                *sockfd = -1;    // Mark socket as invalid
+                
+                // Attempt to reconnect
+                *sockfd = connect_to_server(server_ip, server_port);
+                if (*sockfd < 0) {
+                    fprintf(stderr, "Impossible de se reconnecter\n");
+                    fflush(stderr);
+                    free(data_with_newline);
+                    return;
+                } else {
+                    printf("Reconnexion réussie.\n");
+                    total_sent = 0;  // Reset to resend data
+                    continue;
+                }
+            }
+            break;
+        }
+        total_sent += bytes_sent;
+    }
+
+    if (total_sent == length + 2) {
+        printf("Envoi réussi de %zu octets\n", length + 1);
+    } else {
+        printf("Échec d'envoi complet. Seulement %zu/%zu octets envoyés\n", total_sent, length + 1);
+    }
+
+    free(data_with_newline);
+}
 
 static void print_usage(char *myname)
 {
@@ -53,6 +194,8 @@ static void print_usage(char *myname)
 "  --quiet, -q                 Print out nothing except when reading data \n"
 "  --verbose, -v               Print out extra information\n"
 "  --version                   Print out hidapitester and hidapi version\n"
+"  --ip                        TCP send IP\n"
+"  --port                      TCP send port\n"
 "\n"
 "Notes: \n"
 " . Commands are executed in order. \n"
@@ -100,6 +243,7 @@ enum {
     CMD_READ_FEATURE,
     CMD_READ_INPUT_FOREVER,
     CMD_READ_INPUT_REPORT,
+    CMD_TCP,
 };
 
 bool msg_quiet = false;
@@ -169,6 +313,17 @@ int str2buf(void* buffer, char* delim_str, char* string, int buflen, int bufelem
     return pos;
 }
 
+// Signal handler for abnormal termination signals
+void handle_crash(int sig) {
+    printf("\nCaught signal %d (abnormal termination). Exiting with error...\n", sig);
+    exit(1);  // Exit with non-zero code for abnormal termination
+}
+
+// Signal handler for SIGINT (Ctrl+C)
+void handle_sigint(int sig) {
+    printf("\nCaught signal %d (Ctrl+C). Exiting gracefully...\n", sig);
+    exit(2);  // Proper exit with code 0
+}
 /**
  *
  */
@@ -191,6 +346,16 @@ int main(int argc, char* argv[])
     int descriptorMaxLen = HID_API_MAX_REPORT_DESCRIPTOR_SIZE;
     unsigned char descriptorBuf[descriptorMaxLen];
 
+    // Register the signal handler for SIGINT (Ctrl+C)
+    signal(SIGINT, handle_sigint);
+    //signal(SIGPIPE, SIG_IGN);
+    // Register signal handlers for crashes
+    signal(SIGSEGV, handle_crash);   // Segmentation fault
+    signal(SIGFPE, handle_crash);    // Floating point exception
+    signal(SIGILL, handle_crash);    // Illegal instruction
+    signal(SIGABRT, handle_crash);   // Aborted
+    
+    
     setbuf(stdout, NULL);  // turn off buffering of stdout
 
     if(argc < 2){
@@ -208,6 +373,9 @@ int main(int argc, char* argv[])
          {"length",       required_argument, 0,      'l'},
          {"buflen",       required_argument, 0,      'l'},
          {"base",         required_argument, 0,      'b'},
+         {"ip",           required_argument, 0,      0},
+         {"port",         required_argument, 0,      0},
+         {"TCP",          no_argument,       &cmd,   CMD_TCP},
          {"vidpid",       required_argument, &cmd,   CMD_VIDPID},
          {"usage",        required_argument, &cmd,   CMD_USAGE},
          {"usagePage",    required_argument, &cmd,   CMD_USAGEPAGE},
@@ -230,7 +398,7 @@ int main(int argc, char* argv[])
          {NULL,0,0,0}
         };
     char* shortopts = "vht:l:qb:";
-
+    
     bool done = false;
     int option_index = 0, opt;
     while(!done) {
@@ -241,8 +409,22 @@ int main(int argc, char* argv[])
         if (opt==-1) done = true; // parsed all the args
         switch(opt) {
         case 0:                   // long opts with no short opts
-
-            if( cmd == CMD_VIDPID ) {
+        if (strcmp(longoptions[option_index].name, "ip") == 0) {
+            server_ip = optarg;
+            printf("server_ip : %s\n", server_ip);
+        } else if (strcmp(longoptions[option_index].name, "port") == 0) {
+            server_port = atoi(optarg);
+            printf("server_port : %d\n", server_port);
+        } else if (cmd == CMD_TCP) {
+            // Open TCP connection
+            sockfd = connect_to_server(server_ip, server_port);
+            if (sockfd < 0) {
+                fprintf(stderr, "Échec de la connexion TCP\n");
+                exit(EXIT_FAILURE);
+            } else {
+                printf("Connexion TCP réussie\n");
+            }
+        } else if( cmd == CMD_VIDPID ) {
 
                 if( sscanf(optarg, "%4hx/%4hx", &vid,&pid) !=2 ) {  // match "23FE/AB12"
                     if( !sscanf(optarg, "%4hx:%4hx", &vid,&pid) ) { // match "23FE:AB12"
@@ -320,7 +502,8 @@ int main(int argc, char* argv[])
             else if( cmd == CMD_OPEN ) {
                 if( vid && pid && !usage_page && !usage ) {
                     msg("Opening device, vid/pid: 0x%04X/0x%04X\n",vid,pid);
-                    dev = hid_open(vid,pid,NULL);
+                hid_darwin_set_open_exclusive(0);
+		        dev = hid_open(vid,pid,NULL);
                 }
                 else {
                     msg("Opening device, vid/pid:0x%04X/0x%04X, usagePage/usage: %X/%X\n",
@@ -355,6 +538,7 @@ int main(int argc, char* argv[])
 
                     if( devpath[0] ) {
                         msginfo("Opening device by path: %s\n",devpath);
+                        hid_darwin_set_open_exclusive(0);
                         hid_device *handle = hid_open_path(devpath);
                         if (!handle) {
                             msg("Error: could not open device at path: %s\n",devpath);
@@ -434,7 +618,11 @@ int main(int argc, char* argv[])
                     msg("read %d bytes:\n", res);
                     if( res > 0 ) {
                         printbuf(buf,buflen, print_base, print_width);
-                        memset(buf,0,buflen);  // clear it out
+
+                        // Envoyer les octets via TCP
+                        send_data_to_server(&sockfd, buf, buflen);
+                        
+                        memset(buf, 0, buflen);
                     }
                     else if( res == -1 )  { // removed device
                         cmd = CMD_CLOSE;
@@ -512,5 +700,7 @@ int main(int argc, char* argv[])
         hid_close(dev);
     }
     res = hid_exit();
+    // Fermer la connexion TCP
+    close(sockfd);
 
 } // main
